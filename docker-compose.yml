@@ -1,0 +1,47 @@
+x-backend: &backend
+  build: ./backend
+  environment:
+    DATABASE_URL: postgresql://quant:${POSTGRES_PASSWORD:-quant}@db:5432/quant
+    PAPER_ONLY: ${PAPER_ONLY:-true}
+    SNAPSHOT_SECONDS: ${SNAPSHOT_SECONDS:-60}
+    BOOTSTRAP_BARS: ${BOOTSTRAP_BARS:-120}
+  volumes:
+    - market-data:/var/lib/quant
+  depends_on:
+    db:
+      condition: service_healthy
+  restart: unless-stopped
+
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: quant
+      POSTGRES_DB: quant
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-quant}
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U quant -d quant"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    restart: unless-stopped
+  api:
+    <<: *backend
+    ports:
+      - "127.0.0.1:8000:8000"
+  market:
+    <<: *backend
+    command: ["python", "-m", "app.workers.market"]
+  frontend:
+    build: ./frontend
+    ports:
+      - "127.0.0.1:5173:80"
+    depends_on: [api]
+    restart: unless-stopped
+
+volumes:
+  pg-data:
+  market-data:
+

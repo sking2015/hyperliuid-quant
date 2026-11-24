@@ -1,0 +1,16 @@
+{
+  "spot": [
+    {"universe":[{"tokens":[1,0],"name":"PURR/USDC","index":0,"isCanonical":true}],
+     "tokens":[{"name":"USDC","index":0,"szDecimals":8},{"name":"PURR","index":1,"szDecimals":0}]},
+    [{"coin":"@1194","markPx":"0.0056049"},
+     {"coin":"PURR/USDC","prevDayPx":"0.073079","dayNtlVlm":"865148.5512110001","markPx":"0.07156","midPx":"0.0716315","dayBaseVlm":"11709227.0"}]
+  ],
+  "perp": [
+    {"universe":[{"szDecimals":5,"name":"BTC","maxLeverage":40,"marginTableId":56}],"collateralToken":0},
+    [{"funding":"-0.000001579","openInterest":"36906.11794","prevDayPx":"61428.0","dayNtlVlm":"4885163217.6642751694","oraclePx":"60283.0","markPx":"60256.0","midPx":"60246.0"}]
+  ],
+  "candle":{"t":1795491000000,"T":1795491059999,"s":"BTC","i":"1m","o":"60178.0","c":"60200.0","h":"60231.0","l":"60155.0","v":"177.99161","n":901},
+  "ws_bbo":{"channel":"bbo","data":{"coin":"BTC","time":1795491000001,"bbo":[{"px":"60178","sz":"1","n":1},{"px":"60179","sz":"2","n":1}]}},
+  "ws_trades":{"channel":"trades","data":[{"coin":"BTC","side":"B","px":"60179","sz":"0.1","time":1795491000001,"hash":"0x01","tid":1301},{"coin":"BTC","side":"A","px":"60178","sz":"0.2","time":1795491000001,"hash":"0x02","tid":1302}]}
+}
+

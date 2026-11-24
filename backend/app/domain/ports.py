@@ -39,6 +39,10 @@ class TradeIntent:
     reduce_only: bool
     limit_price: Decimal | None = None
     trigger_price: Decimal | None = None
+    target_notional: Decimal | None = None
+    take_profit: Decimal | None = None
+    stop_loss: Decimal | None = None
+    trailing_stop: Decimal | None = None
 
 
 class ExecutionPort(Protocol):
@@ -50,9 +54,18 @@ class LiveExecutionDisabled:
         raise PermissionError("Live execution is disabled")
 
 
+@dataclass(frozen=True)
+class PositionView:
+    side: Literal["LONG", "SHORT"]
+    quantity: Decimal
+
+
 class StrategyContext(Protocol):
     @property
     def clock(self) -> Clock: ...
+    instance_id: str
+    warming: bool
+    def position(self, instrument_id: str) -> PositionView | None: ...
     def history(self, instrument_id: str, interval: str, limit: int) -> tuple[MarketEvent, ...]: ...
 
 

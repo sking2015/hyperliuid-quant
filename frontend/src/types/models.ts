@@ -11,8 +11,9 @@ export interface Member {
   instrument_id: string; symbol: string; status: string; manual: boolean
   pinned: boolean; blocked: boolean; automatic: boolean
 }
-export interface Market {
-  instrument_id: string; symbol: string; market_type: Kind; quote: string | null
+export interface MarketIdentity { instrument_id: string; symbol: string }
+export interface Market extends MarketIdentity {
+  market_type: Kind; quote: string | null
   mark: number | null; volume_24h: number | null; change_24h: number | null
   market_cap: number | null; open_interest: number | null; funding: number | null
   bid: number | null; ask: number | null; spread_bps: number | null
@@ -25,16 +26,22 @@ export interface Result {
 }
 export interface Warning { selector?: Selector; unavailable?: number; eligible?: number; reason?: string }
 export interface Run { id: number; as_of: string; version: number; results: Result[]; warnings: Warning[] }
+export interface RequestMetrics { requests: number; errors: number; error_rate: number | null; latency_ms: number | null }
 export interface Status {
+  api_metrics?: RequestMetrics
   worker_stale: boolean; observed: number
   counts: { market_type: Kind; count: number }[]
-  coverage: { candle_jobs: number; jobs_due: number; last_candle: string | null }
-  gaps: { data_type: string; count: number }[]
+  coverage: { candle_jobs: number; jobs_due: number; last_candle: string | null; bootstrap_remaining?: number; bootstrap_due?: number; recurring_due?: number }
+  gaps: { data_type: string; count: number; recent?: number }[]
+  integrity?: { stale_observed_1m: number }
   worker: { heartbeat: string; state: {
     ws_connected?: boolean; subscriptions?: number; subscription_references?: number
     subscription_overflow?: number; ws_reconnects?: number; snapshot_at?: string
     snapshot_error?: string; history_error?: string; funding_error?: string; market_cap_error?: string; ws_error?: string; disk_free_bytes?: number
     database_bytes?: number | null; data_file_bytes?: number | null
+    disk_alert?: string; collection_paused?: boolean; quota_remaining_bytes?: number
+    host_probe_free_bytes?: number | null; disk_error?: string; ws_latency_ms?: number; ws_data_at?: string
+    upstream_api?: RequestMetrics
   } } | null
 }
 

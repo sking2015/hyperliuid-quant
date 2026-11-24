@@ -188,3 +188,76 @@ def test_bbo_archive_preserves_exchange_and_receive_times(database, raw, tmp_pat
         record = data.read_parquet(str(partition)).select("event_type, payload, epoch_ms(exchange_ts)").fetchone()
         assert record[0] == "bbo" and '"px": "60178"' in record[1]
         assert record[2] == raw["ws_bbo"]["data"]["time"]
+
+def test_backtest_async_queue_repeatability_and_ledger(database, raw):
+    from datetime import datetime, timezone
+    from decimal import Decimal
+    from app.workers.backtest import run_once
+
+    client = database
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    step = timedelta(minutes=1)
+    tokens, _ = spot_rows(*raw["spot"])
+    with storage.connect() as db:
+        catalog(db, "PERP", "", perp_rows(*raw["perp"], tokens, "", 0), now())
+        bars = []
+        for index in (0, 1, 2, 3):
+            stamp = start + step * index
+            bars.append(dict(instrument_id="PERP::0", interval="1m", open_ts=stamp,
+                             close_ts=stamp + step - timedelta(milliseconds=1), o=100, h=105 if index == 2 else 101,
+                             l=99, c=100, v=1, trades=1, source="fixture", is_closed=True, received_ts=now()))
+        save_candles(db, bars)
+    route = "/api/v1/backtests"
+    data = dict(strategy_id="deterministic", instrument_ids=["PERP::0"],
+                parameters={"timeframe": "1m"}, start=start.isoformat(), end=(start + 4*step).isoformat())
+    assert client.post(route + "/preflight", json=data).json()["ready"]
+    coverage = client.get("/api/v1/markets/PERP::0/coverage", params={
+        "start": start.isoformat(), "end": (start + 5*step).isoformat(), "interval": "1m",
+    }).json()
+    assert coverage["available"] == 4 and coverage["missing"] == 1
+    cancelled = client.post(route, json=data).json()["id"]
+    assert client.post(f"{route}/{cancelled}/cancel").json()["status"] == "CANCELLED"
+    reports = []
+    for _ in range(2):
+        response = client.post(route, json=data)
+        assert response.status_code == 202, response.text
+        path = f"{route}/{response.json()['id']}"
+        assert run_once()
+        status = client.get(path).json()
+        assert status["status"] == "SUCCEEDED", status
+        report = client.get(path + "/report").json()
+        ledger = client.get(path + "/ledger").json()
+        assert abs(Decimal("1000") + sum(Decimal(entry["amount"]) for entry in ledger)
+                   - Decimal(report["metrics"]["final_cash"])) < Decimal("1e-20")
+        assert report["metrics"]["trade_count"] > 0
+        assert client.get(path + "/trades.csv").status_code == 200
+        reports.append(report)
+    assert reports[0] == reports[1]
+
+def test_backtest_freezes_observation_pool_membership(database, raw):
+    from datetime import datetime, timezone
+    from app.workers.backtest import run_once
+
+    client = database
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    end = start + timedelta(minutes=1)
+    tokens, _ = spot_rows(*raw["spot"])
+    with storage.connect() as db:
+        catalog(db, "PERP", "", perp_rows(*raw["perp"], tokens, "", 0), now())
+        save_candles(db, [dict(instrument_id="PERP::0", interval="1m", open_ts=start,
+                              close_ts=end - timedelta(milliseconds=1), o=100, h=100,
+                              l=100, c=100, v=1, trades=1, source="fixture", is_closed=True,
+                              received_ts=now())])
+    pool = client.post("/api/v1/watchlists", json={"name": "Frozen test"}).json()
+    member = f"/api/v1/watchlists/{pool['id']}/members/PERP::0"
+    assert client.post(member, json={}).status_code == 200
+    created = client.post("/api/v1/backtests", json=dict(strategy_id="deterministic",
+                          watchlist_id=pool["id"], parameters={"timeframe": "1m"},
+                          start=start.isoformat(), end=end.isoformat()))
+    assert created.status_code == 202, created.text
+    assert client.delete(member).status_code == 200
+    assert run_once()
+    task = client.get("/api/v1/backtests/" + created.json()["id"]).json()
+    assert task["status"] == "SUCCEEDED"
+    assert task["configuration"]["watchlist"]["id"] == pool["id"]
+    assert task["configuration"]["instrument_ids"] == ["PERP::0"]

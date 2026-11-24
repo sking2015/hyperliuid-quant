@@ -2,7 +2,6 @@ import asyncio
 import logging
 import math
 import os
-import shutil
 from datetime import timedelta
 
 import httpx
@@ -12,6 +11,7 @@ from app.config import BOOTSTRAP_BARS, DATA_DIR, HISTORY_INTERVALS, MINUTES, SNA
 from app.exchange.hyperliquid.public import PublicClient, candle, outcome_rows, perp_rows, spot_rows, timestamp
 from app.market_data.capitalization import load_caps
 from app.market_data.funding import funding_loop
+from app.market_data.monitor import disk_status
 from app.market_data.import_jobs import import_loop
 from app.market_data.repository import catalog, now, record_gaps, save_candles
 from app.market_data.stream import stream_loop
@@ -62,6 +62,9 @@ async def snapshot_once(client, state):
 async def snapshots(client, state):
     loop = asyncio.get_running_loop()
     while True:
+        if state.get("collection_paused"):
+            await asyncio.sleep(2)
+            continue
         start = loop.time()
         try:
             await snapshot_once(client, state)
@@ -71,7 +74,7 @@ async def snapshots(client, state):
         await asyncio.sleep(max(1, SNAPSHOT_SECONDS - (loop.time() - start)))
 
 
-def next_history_job(priority):
+def next_history_job(priority, prefer_bootstrap=True):
     with connect() as db:
         db.execute("""
             INSERT INTO history_jobs(instrument_id,interval)
@@ -85,9 +88,10 @@ def next_history_job(priority):
                 SELECT 1 FROM watchlist_members m JOIN watchlists w ON w.id=m.watchlist_id
                 WHERE m.instrument_id=i.instrument_id AND w.enabled AND w.deleted_at IS NULL
                   AND NOT m.blocked AND (m.manual OR m.pinned OR m.automatic)
-            ) THEN CASE h.interval WHEN '1m' THEN 0 ELSE 1 END ELSE 2 END, h.next_due,
+            ) THEN CASE h.interval WHEN '1m' THEN 0 ELSE 1 END ELSE 2 END,
+            ((h.progress_ts IS NULL) = %s) DESC, h.next_due,
             CASE h.interval WHEN '1m' THEN 0 ELSE 1 END, i.instrument_id, h.interval LIMIT 1
-        """, (priority,)).fetchone()
+        """, (priority, prefer_bootstrap)).fetchone()
 
 
 def complete_job(job, bars, start, end, success):
@@ -132,7 +136,8 @@ async def history_loop(client, state):
     turn = 0
     while True:
         try:
-            job = await asyncio.to_thread(next_history_job, turn % 3 != 0)
+            job = None if state.get("collection_paused") else await asyncio.to_thread(
+                next_history_job, turn % 3 != 0, turn % 3 == 0)
             turn += 1
             if job:
                 await history_once(client, job)
@@ -150,8 +155,9 @@ def maintain(state):
             AND (last_refresh IS NULL OR last_refresh + (config->>'refresh_seconds')::integer * interval '1 second' <= now())
             ORDER BY last_refresh NULLS FIRST LIMIT 10 FOR UPDATE SKIP LOCKED
         """)
-        for pool in pools:
-            refresh(db, pool, now())
+        if not state.get("collection_paused"):
+            for pool in pools:
+                refresh(db, pool, now())
         db.execute("""
             INSERT INTO worker_leases VALUES ('market',now(),%s) ON CONFLICT(component)
             DO UPDATE SET heartbeat=excluded.heartbeat,state=excluded.state
@@ -202,13 +208,24 @@ async def storage_stats(state):
                 state[name] = None
             else:
                 state[name] = value
-        await asyncio.sleep(60)
+        if all(isinstance(value, int) for value in metrics):
+            state["_storage_total"] = tuple(metrics)
+        else:
+            state.pop("_storage_total", None)
+            state.update(disk_alert="unavailable", collection_paused=True)
+        await asyncio.sleep(30)
 
 
-async def maintenance(state):
+async def maintenance(state, client):
     while True:
         try:
-            state["disk_free_bytes"] = shutil.disk_usage(DATA_DIR).free
+            state["upstream_api"] = client.metrics.snapshot()
+            try:
+                if "_storage_total" in state:
+                    state.update(await asyncio.to_thread(disk_status, *state["_storage_total"]))
+                    state.pop("disk_error", None)
+            except OSError as exc:
+                state.update(disk_alert="unavailable", collection_paused=True, disk_error=str(exc))
             await asyncio.to_thread(maintain, state.copy())
         except Exception:
             log.exception("market maintenance failed")
@@ -218,7 +235,7 @@ async def maintenance(state):
 async def main():
     migrate()
     DATA_DIR.mkdir(exist_ok=True, parents=True)
-    state = {"ws_connected": False}
+    state = {"ws_connected": False, "collection_paused": True, "disk_alert": "checking"}
     # Hold a session-scoped PostgreSQL lock so duplicate workers cannot double the IP budget.
     with connect() as lease:
         if not lease.execute("SELECT pg_try_advisory_lock(6022027) AS acquired").fetchone()["acquired"]:
@@ -227,8 +244,8 @@ async def main():
         async with httpx.AsyncClient(timeout=12, proxy=os.getenv("HL_HTTP_PROXY")) as http:
             client = PublicClient(http)
             await asyncio.gather(snapshots(client, state), history_loop(client, state), stream_loop(state),
-                                 maintenance(state), storage_stats(state), funding_loop(client, state),
-                                 import_loop(), check_lease(lease))
+                                 maintenance(state, client), storage_stats(state), funding_loop(client, state),
+                                 import_loop(state), check_lease(lease))
 
 
 async def check_lease(lease):

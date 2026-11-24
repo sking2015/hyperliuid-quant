@@ -30,7 +30,11 @@ test('browse mainnet markets and manage a manual and Top 10 observation pool', a
 
     await page.getByRole('button', { name: '观察池', exact: true }).click()
     await page.getByRole('button', { name: manualName + ' · 手动' }).click()
-    await expect(page.getByRole('cell', { name: 'BTC', exact: true })).toBeVisible()
+    await page.getByRole('button', { name: 'BTC', exact: true }).click()
+    const memberChart = page.getByRole('dialog', { name: 'BTC' })
+    await expect(memberChart.locator('canvas').first()).toBeVisible()
+    await expect(memberChart.getByText(/标记价/)).toBeVisible()
+    await memberChart.getByRole('button', { name: '关闭此对话框' }).click()
     await page.getByRole('button', { name: '新建观察池', exact: true }).click()
     await page.getByRole('textbox', { name: '名称' }).fill(dynamicName)
     await page.getByRole('combobox', { name: '类型' }).press('ArrowDown')

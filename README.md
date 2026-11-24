@@ -68,7 +68,7 @@ docker compose config --quiet
 
 ## 数据与恢复
 
-- PostgreSQL 是目录、观察池、行情快照、事件、资金费率和在线 K 线的权威存储。闭合 K 线使用 REST 确认，历史轮转覆盖 1m/3m/5m/15m/1h/4h/1d。Outcomes 当前仅目录。永续 OI 以基础资产计。
+- PostgreSQL 是目录、观察池、行情快照、事件、资金费率和在线 K 线的权威存储。闭合 K 线使用 REST 确认，历史轮转覆盖 1m/3m/5m/15m/30m/1h/4h/1d。Outcomes 当前仅目录。永续 OI 以基础资产计。
 - 24h 成交额筛选仅对 USDC 计价市场做可比排序。30 分钟波动率使用 30 个连续的 1m 收益率。成交量异动使用最近 5 根闭合 1m K 线的 `close × volume` 之和，与前五个等长窗口的平均值相比。该数值是成交额估算。
 - 外部流通市值可由部署者配置 `MARKET_CAP_FILE` 指向只读 JSON 文件，按稳定资产 ID 显式映射。例如 `{"PERP::0":{"market_cap_usd":"1200000000000","as_of":"2026-11-24T03:00:00Z","source":"vendor:bitcoin"}}`。超过 24 小时或缺失的市值显示 N/A。
 - 使用 `python -m app.market_data.archive --date YYYY-MM-DD` 导出已过去的 UTC 日期内已采集的闭合 K 线。追加 `--dataset bbo` 或 `--dataset trades` 可按接收日期归档对应事件。分区按 UTC 日期及市场分类，写入 ZSTD Parquet，回读校验、计算 SHA-256 并登记 manifest。Parquet 可作为冻结的研究输入，金额字段按精确的十进制字符串保存。自动热数据清理待完成。
@@ -77,3 +77,20 @@ docker compose config --quiet
 
 设计、实施分期和验收记录见 [设计基线](doc/Hyperliquid_Quant_Design_v1.md)、[实施计划](docs/IMPLEMENTATION_PLAN.md) 和 [开发进度](docs/PROGRESS.md)。
 
+
+## M1 运行保障
+
+- 系统页展示首次补齐与周期续采、观察池闭合 1m K 线超时、近 24 小时缺口、WS 行情延迟、上游 REST 错误率及本地 API 5xx 比例。错误率取最近 5 分钟的进程内样本。
+- 采集默认在可用空间或项目配额余量低于 2 GiB 时告警，低于 512 MiB 时暂停 REST、WS 与后台行情导入。空间恢复后自动续采。使用 `DISK_WARN_MIB`、`DISK_STOP_MIB`、`DATA_MAX_MIB` 配置，默认项目配额为 10 GiB。项目配额按当前 PostgreSQL 库与行情文件占用计算。Docker 虚拟磁盘空间仍按容器视角显示。可向 market 容器额外挂载只读的宿主磁盘目录，并将 `DISK_PROBE_PATH` 设为该挂载的容器路径，将其报告的可用空间也纳入保护。
+- 在行情弹窗选择周期和日期范围后查询闭合 K 线覆盖率。REST 对应 `GET /api/v1/markets/{id}/coverage?interval=15m&start=...&end=...`，区间为左闭右开。
+- 已启动 Compose 时可执行 `python scripts/m1_load.py --seconds 60`。脚本创建临时观察池订阅 20 个原生资产，记录延迟和重连，结束后移除测试池。
+
+## M2 回测
+
+启动 Compose 后，在「策略」配置 EMA 或确定性测试策略，在「回测」选择原生 USDC 永续或观察池、日期范围和成本。时间须对齐选定周期。集合、观察池规则版本及策略代码哈希在提交时冻结。每次任务在独立回测 worker 内创建隔离虚拟账户，初始资金、仓位、指标与策略状态按实例分开。报告可查看并导出交易 CSV，点击成交记录可联动 K 线图。
+
+- 回测要求每个资产的闭合 K 线与预热完整。可要求所有历史资金费率时段覆盖，否则报告明确标记缺失时段。资金费率使用实际历史利率，L1 的结算名义价格使用结算时最后已知 K 线价格近似交易所预言机价格。[Hyperliquid 官方资金费率](https://hyperliquid.gitbook.io/hyperliquid-docs/trading/funding)
+- 收盘意图默认下一根开盘执行，反向信号先平仓。同根触及止盈和止损时先处理止损，跳空止损按开盘可用价格并计滑点。盘中触发只能从 OHLC 推断，持仓期内不能确定先后的事件按报告模型处理。末尾持仓以最后已知价格估值。
+- 基础风控检查可用资金、保证金、持仓数和总敞口。L1 报告用作工程验证，保证金阶梯、强平预测、实时模拟及盘口撮合属于后续工作。
+- 信号研究在策略运行结束后单独计算方向收益和 MFE/MAE。仅对当前 K 线粒度能完整覆盖的 1、5、15、60 分钟窗口给出样本。
+- `TEST_DATABASE_URL` 指向隔离 PostgreSQL 后运行 `python -m pytest -p no:cacheprovider backend/tests -q`。浏览器验收可设置 `M2_REPORT_ID` 为带已平仓交易的回测 ID，再运行 `npm --prefix frontend run test:e2e`。

@@ -92,6 +92,9 @@ async def stream_loop(state):
     last_received = now()
     outage = None
     while True:
+        if state.get("collection_paused"):
+            await asyncio.sleep(2)
+            continue
         try:
             async with websocket(WS, open_timeout=10, max_queue=32, ping_interval=None) as socket:
                 current = {}
@@ -103,6 +106,10 @@ async def stream_loop(state):
                 last_received = now()
                 batch = []
                 while True:
+                    if state.get("collection_paused"):
+                        outage = (current, last_received) if current else None
+                        state.update(ws_connected=False, subscriptions=0)
+                        break
                     tick = loop.time()
                     if tick >= reconcile:
                         assets, counts = await asyncio.to_thread(subscription_refs)
@@ -121,7 +128,14 @@ async def stream_loop(state):
                         last_received = now()
                         delay = 1
                         message = json.loads(raw)
-                        if message.get("channel") == "error":
+                        channel = message.get("channel")
+                        data = message.get("data")
+                        sample = data[-1] if channel == "trades" and data else data
+                        if channel in ("bbo", "trades") and isinstance(sample, dict) and "time" in sample:
+                            latency = max(0, int(last_received.timestamp() * 1000) - sample["time"])
+                            state["ws_latency_ms"] = round(state.get("ws_latency_ms", latency) * .9 + latency * .1)
+                            state["ws_data_at"] = last_received.isoformat()
+                        if channel == "error":
                             state["ws_error"] = str(message.get("data"))[:250]
                         batch.append((message, last_received))
                     except asyncio.TimeoutError:

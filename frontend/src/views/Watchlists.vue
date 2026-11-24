@@ -3,12 +3,14 @@ import { onMounted, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { api } from '../api/client'
 import { dateTime, kinds, numeric, selectorNames } from '../format'
-import type { Draft, Market, Member, Pool, Result, Run, Warning } from '../types/models'
+import MarketDialog from '../components/MarketDialog.vue'
+import type { MarketIdentity, Draft, Market, Member, Pool, Result, Run, Warning } from '../types/models'
 
 defineProps<{ utc: boolean }>()
 const types = { MANUAL: '手动', DYNAMIC: '动态', MIXED: '混合' }
 const pools = ref<Pool[]>([])
 const id = ref('')
+const selectedMarket = ref<MarketIdentity>()
 const members = ref<Member[]>([])
 const runs = ref<Run[]>([])
 const results = ref<Result[]>([])
@@ -150,7 +152,9 @@ onMounted(() => void perform(loadPools))
           <el-button :disabled="!candidate" @click="applyMember(candidate, {manual:false,pinned:false,blocked:true})">加入黑名单</el-button>
         </div>
         <el-table :data="members" empty-text="暂无成员">
-          <el-table-column prop="symbol" label="资产" min-width="125" />
+          <el-table-column prop="symbol" label="交易对" min-width="125">
+            <template #default="{ row }"><el-button link type="primary" @click="selectedMarket = row">{{ row.symbol }}</el-button></template>
+          </el-table-column>
           <el-table-column label="来源" min-width="130"><template #default="{row}">{{ [row.manual && '手动', row.automatic && '自动', row.pinned && '置顶', row.blocked && '黑名单', row.status === 'DELISTED' && '已下线'].filter(Boolean).join(' / ') }}</template></el-table-column>
           <el-table-column label="操作" min-width="205"><template #default="{row}">
             <el-button link @click="applyMember(row.instrument_id, {...row,pinned:!row.pinned})">{{ row.pinned ? '取消置顶' : '置顶' }}</el-button>
@@ -172,5 +176,5 @@ onMounted(() => void perform(loadPools))
       </template>
     </section>
   </div>
+  <MarketDialog :instrument="selectedMarket" :utc="utc" @close="selectedMarket = undefined" />
 </template>
-

@@ -5,6 +5,10 @@ x-backend: &backend
     PAPER_ONLY: ${PAPER_ONLY:-true}
     SNAPSHOT_SECONDS: ${SNAPSHOT_SECONDS:-60}
     BOOTSTRAP_BARS: ${BOOTSTRAP_BARS:-120}
+    DISK_WARN_MIB: ${DISK_WARN_MIB:-2048}
+    DISK_STOP_MIB: ${DISK_STOP_MIB:-512}
+    DATA_MAX_MIB: ${DATA_MAX_MIB:-10240}
+    DISK_PROBE_PATH: ${DISK_PROBE_PATH:-}
   volumes:
     - market-data:/var/lib/quant
   depends_on:
@@ -34,6 +38,9 @@ services:
   market:
     <<: *backend
     command: ["python", "-m", "app.workers.market"]
+  backtest:
+    <<: *backend
+    command: ["python", "-m", "app.workers.backtest"]
   frontend:
     build: ./frontend
     ports:

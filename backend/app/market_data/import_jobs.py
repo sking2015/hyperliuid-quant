@@ -45,10 +45,11 @@ def run_one_job():
         """, (status, count, error, job["id"]))
 
 
-async def import_loop():
+async def import_loop(state):
     while True:
         try:
-            await asyncio.to_thread(run_one_job)
+            if not state.get("collection_paused"):
+                await asyncio.to_thread(run_one_job)
         except Exception:
             log.exception("import job maintenance failed")
         await asyncio.sleep(5)

@@ -2,6 +2,9 @@ import asyncio
 from collections import deque
 from datetime import datetime, timezone
 from decimal import Decimal
+from time import monotonic
+
+from app.market_data.monitor import RequestMetrics
 
 import httpx
 
@@ -22,6 +25,7 @@ class PublicClient:
         self.http = http
         self.entries = deque()
         self.used = 0
+        self.metrics = RequestMetrics()
         self.lock = asyncio.Lock()
 
     async def reserve(self, weight):
@@ -40,7 +44,13 @@ class PublicClient:
     async def info(self, payload, weight=20):
         for attempt in range(3):
             await self.reserve(weight)
-            response = await self.http.post(INFO, json=payload)
+            started = monotonic()
+            try:
+                response = await self.http.post(INFO, json=payload)
+            except httpx.HTTPError:
+                self.metrics.record(True, (monotonic() - started) * 1000)
+                raise
+            self.metrics.record(response.is_error, (monotonic() - started) * 1000)
             if response.status_code == 429 and attempt < 2:
                 retry = response.headers.get("Retry-After", "")
                 await asyncio.sleep(min(60, max(2 ** attempt, int(retry) if retry.isdigit() else 0)))

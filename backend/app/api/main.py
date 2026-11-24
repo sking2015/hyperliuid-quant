@@ -2,6 +2,7 @@ import asyncio
 import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
+from time import monotonic
 from typing import Literal
 from uuid import UUID, uuid4
 
@@ -13,7 +14,10 @@ from psycopg import OperationalError
 from psycopg.types.json import Jsonb
 from pydantic import BaseModel, Field
 
+from app.backtest.routes import router as backtest_router
 from app.config import MINUTES
+from app.market_data.coverage import interval_coverage
+from app.market_data.monitor import RequestMetrics
 from app.market_data.import_jobs import input_path
 from app.market_data.repository import MARKETS, now
 from app.selectors.ranking import Rules
@@ -34,16 +38,24 @@ async def lifespan(app):
 
 
 app = FastAPI(title="HL Quant Lab", version="1.0", lifespan=lifespan)
+app.include_router(backtest_router)
+api_metrics = RequestMetrics()
 
 
 @app.middleware("http")
 async def request_id(request, call_next):
+    started = monotonic()
     request.state.request_id = str(uuid4())
     origin = request.headers.get("origin")
     if request.method not in ("GET", "HEAD", "OPTIONS") and origin and origin not in ORIGINS:
         response = await error(request, HTTPException(403, "请求来源未授权"))
     else:
-        response = await call_next(request)
+        try:
+            response = await call_next(request)
+        except Exception:
+            api_metrics.record(True, (monotonic() - started) * 1000)
+            raise
+    api_metrics.record(response.status_code >= 500, (monotonic() - started) * 1000)
     response.headers["X-Request-ID"] = request.state.request_id
     return response
 
@@ -58,8 +70,8 @@ async def error(request: Request, exc):
         status, message, details = 422, "请求参数无效", jsonable_encoder(exc.errors())
     else:
         status, message, details = 503, "数据库暂不可用", None
-    return JSONResponse({"code": str(status), "message": message, "details": details,
-                         "request_id": request.state.request_id}, status_code=status)
+    return JSONResponse(jsonable_encoder({"code": str(status), "message": message, "details": details,
+                                         "request_id": request.state.request_id}), status_code=status)
 
 
 def system_status():
@@ -68,7 +80,11 @@ def system_status():
         counts = db.execute("SELECT market_type,count(*) FROM instruments WHERE status='ACTIVE' GROUP BY market_type").fetchall()
         coverage = db.execute("""
             SELECT count(*) AS candle_jobs, count(*) FILTER (WHERE next_due <= now()) AS jobs_due,
-                   max(progress_ts) AS last_candle FROM history_jobs
+                   count(*) FILTER (WHERE progress_ts IS NULL) AS bootstrap_remaining,
+                   count(*) FILTER (WHERE progress_ts IS NULL AND next_due <= now()) AS bootstrap_due,
+                   count(*) FILTER (WHERE progress_ts IS NOT NULL AND next_due <= now()) AS recurring_due,
+                   max(progress_ts) AS last_candle FROM history_jobs JOIN instruments USING (instrument_id)
+                   WHERE instruments.status='ACTIVE' 
         """).fetchone()
         subscriptions = db.execute(f"""
             SELECT count(DISTINCT instrument_id) AS observed FROM watchlist_members
@@ -76,10 +92,26 @@ def system_status():
             JOIN instruments USING (instrument_id)
             WHERE watchlists.enabled AND deleted_at IS NULL AND instruments.status='ACTIVE' AND {ACTIVE}
         """).fetchone()
-        gaps = db.execute("SELECT data_type,count(*) FROM data_gaps GROUP BY data_type").fetchall()
+        gaps = db.execute("""
+            SELECT data_type,count(*),count(*) FILTER (WHERE end_ts >= now()-interval '24 hours') AS recent
+            FROM data_gaps GROUP BY data_type ORDER BY data_type
+        """).fetchall()
+        integrity = db.execute("""
+            WITH tracked AS (
+              SELECT DISTINCT m.instrument_id FROM watchlist_members m JOIN watchlists w ON w.id=m.watchlist_id
+              JOIN instruments i USING (instrument_id)
+              WHERE w.enabled AND w.deleted_at IS NULL AND i.status='ACTIVE'
+              AND NOT m.blocked AND (m.manual OR m.pinned OR m.automatic) AND i.market_type<>'OUTCOME'
+            )
+            SELECT count(*) FILTER (WHERE c.open_ts IS NULL) AS stale_observed_1m
+            FROM tracked t LEFT JOIN LATERAL (
+              SELECT open_ts FROM candles c WHERE c.instrument_id=t.instrument_id AND c.interval='1m'
+              AND c.is_closed AND c.open_ts >= now()-interval '5 minutes' LIMIT 1
+            ) c ON true
+        """).fetchone()
     stamp = now()
     return dict(paper_only=True, now=stamp, worker=worker, counts=counts, coverage=coverage,
-                observed=subscriptions["observed"], gaps=gaps,
+                observed=subscriptions["observed"], gaps=gaps, integrity=integrity, api_metrics=api_metrics.snapshot(),
                 worker_stale=worker is None or worker["heartbeat"] < stamp - timedelta(seconds=20))
 
 
@@ -106,12 +138,27 @@ def markets(q: str = Query("", max_length=100), market_type: MarketType | None =
         total = db.execute("SELECT count(*) FROM instruments" + clauses, params).fetchone()["count"]
         rows = db.execute(MARKETS + clauses + f" ORDER BY {sort} {direction} NULLS LAST, instrument_id LIMIT %(limit)s OFFSET %(offset)s",
                           params).fetchall()
-    for row in rows:
-        row["stale"] = row["as_of"] is None or row["as_of"] < params["as_of"] - timedelta(minutes=3)
-        row["open_interest_unit"] = "base" if row["open_interest"] is not None else None
-        row["spread_bps"] = ((row["ask"] - row["bid"]) * 20000 / (row["ask"] + row["bid"])
-                             if row["bid"] and row["ask"] and row["ask"] >= row["bid"] else None)
-    return {"items": rows, "total": total, "as_of": params["as_of"]}
+    return {"items": [market_details(row, params["as_of"]) for row in rows],
+            "total": total, "as_of": params["as_of"]}
+
+
+def market_details(row, as_of):
+    row["stale"] = row["as_of"] is None or row["as_of"] < as_of - timedelta(minutes=3)
+    row["open_interest_unit"] = "base" if row["open_interest"] is not None else None
+    row["spread_bps"] = ((row["ask"] - row["bid"]) * 20000 / (row["ask"] + row["bid"])
+                         if row["bid"] and row["ask"] and row["ask"] >= row["bid"] else None)
+    return row
+
+
+@app.get(API + "/markets/{instrument_id}")
+def market(instrument_id: str):
+    as_of = now()
+    with connect() as db:
+        row = db.execute(MARKETS + " WHERE i.instrument_id=%(id)s",
+                         {"id": instrument_id, "as_of": as_of}).fetchone()
+    if row is None:
+        raise HTTPException(404, "找不到市场")
+    return market_details(row, as_of)
 
 
 def require_instrument(db, instrument_id):
@@ -137,9 +184,16 @@ def candles(instrument_id: str, interval: str = "1m", start: datetime | None = N
 
 
 @app.get(API + "/markets/{instrument_id}/coverage")
-def coverage(instrument_id: str, limit: int = Query(100, ge=1, le=500)):
+def coverage(instrument_id: str, limit: int = Query(100, ge=1, le=500),
+             interval: str | None = None, start: datetime | None = None, end: datetime | None = None):
     with connect() as db:
         require_instrument(db, instrument_id)
+        if interval is not None or start is not None or end is not None:
+            if (interval not in MINUTES or start is None or end is None or start.utcoffset() is None
+                    or end.utcoffset() is None or end <= start
+                    or (end - start).total_seconds() > MINUTES[interval] * 60 * 100000):
+                raise HTTPException(422, "请提供周期和有效的带时区起止时间，最多查询十万根 K 线")
+            return interval_coverage(db, instrument_id, interval, start, end)
         ranges = db.execute("""
             SELECT interval,min(open_ts) AS start,max(close_ts) AS end,count(*) AS bars
             FROM candles WHERE instrument_id=%s AND is_closed GROUP BY interval ORDER BY interval
@@ -152,7 +206,7 @@ def coverage(instrument_id: str, limit: int = Query(100, ge=1, le=500)):
 class ImportDraft(BaseModel):
     filename: str = Field(min_length=1, max_length=255)
     instrument_id: str = Field(min_length=1, max_length=100)
-    interval: Literal["1m", "3m", "5m", "15m", "1h", "4h", "1d"]
+    interval: Literal["1m", "3m", "5m", "15m", "30m", "1h", "4h", "1d"]
     source: str = Field(min_length=1, max_length=100, pattern=r"\S")
 
 

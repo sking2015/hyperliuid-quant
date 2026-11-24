@@ -44,7 +44,7 @@ async def funding_loop(client, state):
     while True:
         job = None
         try:
-            job = await asyncio.to_thread(next_funding_job)
+            job = None if state.get("collection_paused") else await asyncio.to_thread(next_funding_job)
             if job:
                 received = now()
                 end = int(received.timestamp() * 1000)

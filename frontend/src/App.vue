@@ -1,13 +1,21 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { computed, defineAsyncComponent, onMounted, onUnmounted, ref } from 'vue'
 import { api } from './api/client'
-import { dateTime, kinds, numeric } from './format'
+import { dateTime, kinds, numeric, percent } from './format'
 import type { Status } from './types/models'
 import Markets from './views/Markets.vue'
 import Watchlists from './views/Watchlists.vue'
 
-const page = ref<'markets' | 'watchlists' | 'system'>('markets')
-const labels = { markets: '市场', watchlists: '观察池', system: '系统' }
+const Strategies = defineAsyncComponent(() => import('./views/Strategies.vue'))
+const Backtests = defineAsyncComponent(() => import('./views/Backtests.vue'))
+const page = ref<'markets' | 'watchlists' | 'strategies' | 'backtests' | 'system'>('markets')
+const preset = ref<{ id: string; params: Record<string, number | string> }>()
+
+function useStrategy(id: string, params: Record<string, number | string>) {
+  preset.value = { id, params }
+  page.value = 'backtests'
+}
+const labels = { markets: '市场', watchlists: '观察池', strategies: '策略', backtests: '回测', system: '系统' }
 const utc = ref(true)
 const classic = ref(false)
 const status = ref<Status>()
@@ -82,12 +90,20 @@ onUnmounted(() => { stopped = true; clearTimeout(retry); socket?.close() })
       <el-alert v-if="error" :title="error" type="error" :closable="false" />
       <Markets v-if="page === 'markets'" :utc="utc" />
       <Watchlists v-if="page === 'watchlists'" :utc="utc" />
+      <Strategies v-if="page === 'strategies'" @backtest="useStrategy" />
+      <Backtests v-if="page === 'backtests'" :utc="utc" :preset="preset" />
       <section v-if="page === 'system'" class="panel">
         <div v-if="status">
           <dl class="metrics">
             <div v-for="item in status.counts" :key="item.market_type"><dt>{{ kinds[item.market_type] }}</dt><dd>{{ numeric(item.count) }}</dd></div>
             <div><dt>观察资产</dt><dd>{{ numeric(status.observed) }}</dd></div>
-            <div><dt>待补齐 K 线任务</dt><dd>{{ numeric(status.coverage.jobs_due) }}</dd></div>
+            <div><dt>首次补齐未完成</dt><dd>{{ numeric(status.coverage.bootstrap_remaining) }}</dd></div>
+            <div><dt>首次补齐已到期</dt><dd>{{ numeric(status.coverage.bootstrap_due) }}</dd></div>
+            <div><dt>周期续采已到期</dt><dd>{{ numeric(status.coverage.recurring_due) }}</dd></div>
+            <div><dt>观察池 5 分钟无闭合 1m K 线</dt><dd>{{ numeric(status.integrity?.stale_observed_1m) }}</dd></div>
+            <div><dt>WS 行情延迟 (ms)</dt><dd>{{ numeric(status.worker?.state.ws_latency_ms) }}</dd></div>
+            <div><dt>上游 API 错误率（近 5 分钟）</dt><dd>{{ percent(status.worker?.state.upstream_api?.error_rate ?? null) }}</dd></div>
+            <div><dt>本地 API 5xx（近 5 分钟）</dt><dd>{{ percent(status.api_metrics?.error_rate ?? null) }}</dd></div>
             <div><dt>行情订阅</dt><dd>{{ numeric(status.worker?.state.subscriptions) }}</dd></div>
             <div><dt>订阅池引用</dt><dd>{{ numeric(status.worker?.state.subscription_references) }}</dd></div>
             <div><dt>重连次数</dt><dd>{{ numeric(status.worker?.state.ws_reconnects) }}</dd></div>
@@ -96,14 +112,19 @@ onUnmounted(() => { stopped = true; clearTimeout(retry); socket?.close() })
             <div><dt>行情文件目录占用</dt><dd>{{ storageSize(status.worker?.state.data_file_bytes) }}</dd></div>
             <div><dt>容器视角剩余空间</dt><dd>{{ storageSize(status.worker?.state.disk_free_bytes) }}</dd></div>
           </dl>
-          <p class="muted">占用每分钟更新。数据库占用含表和索引，文件目录含归档和导入文件。</p>
+          <el-alert v-if="status.worker?.state.collection_paused" title="磁盘保护已暂停采集，空间恢复后自动续采" type="error" :closable="false" />
+          <el-alert v-else-if="status.worker?.state.disk_alert === 'warning'" title="存储空间接近采集保护阈值" type="warning" :closable="false" />
+          <p v-if="status.worker?.state.host_probe_free_bytes != null">宿主盘探针剩余 · {{ storageSize(status.worker.state.host_probe_free_bytes) }}</p>
+          <p>项目配额余量 · {{ storageSize(status.worker?.state.quota_remaining_bytes) }}</p>
+          <p>最近收到 WS 行情 · {{ dateTime(status.worker?.state.ws_data_at, utc) }}</p>
+          <p class="muted">占用每 30 秒更新。数据库占用含表和索引，文件目录含归档和导入文件。</p>
           <p>采集心跳 · {{ status.worker_stale ? '缺失或过期' : '正常' }} · {{ dateTime(status.worker?.heartbeat, utc) }}</p>
           <p>快照采集 · {{ dateTime(status.worker?.state.snapshot_at, utc) }}</p>
           <p>已补齐 K 线至 · {{ dateTime(status.coverage.last_candle, utc) }}</p>
           <p v-if="status.worker?.state.subscription_overflow">超出订阅容量 · {{ status.worker.state.subscription_overflow }} 个资产</p>
           <el-alert v-for="message in [status.worker?.state.snapshot_error, status.worker?.state.history_error, status.worker?.state.funding_error, status.worker?.state.market_cap_error, status.worker?.state.ws_error].filter(Boolean)" :key="message" :title="message" type="warning" :closable="false" />
           <h2>数据缺口</h2>
-          <el-table :data="status.gaps" empty-text="暂无记录"><el-table-column prop="data_type" label="来源" /><el-table-column prop="count" label="缺口数" /></el-table>
+          <el-table :data="status.gaps" empty-text="暂无记录"><el-table-column prop="data_type" label="来源" /><el-table-column prop="count" label="缺口数" /><el-table-column prop="recent" label="近 24 小时" /></el-table>
         </div>
         <el-empty v-else description="系统状态暂不可用" />
       </section>

@@ -2,6 +2,8 @@ x-backend: &backend
   build: ./backend
   environment:
     DATABASE_URL: postgresql://quant:${POSTGRES_PASSWORD:-quant}@db:5432/quant
+    RESEARCH_ASSETS: ${RESEARCH_ASSETS:-BTC,ETH,SOL,HYPE,DOGE,XRP,ADA,AVAX,LINK,SUI}
+    RESEARCH_RESUME_MIB: ${RESEARCH_RESUME_MIB:-128}
     PAPER_ONLY: ${PAPER_ONLY:-true}
     SNAPSHOT_SECONDS: ${SNAPSHOT_SECONDS:-60}
     BOOTSTRAP_BARS: ${BOOTSTRAP_BARS:-120}
@@ -41,6 +43,15 @@ services:
   backtest:
     <<: *backend
     command: ["python", "-m", "app.workers.backtest"]
+  depth:
+    <<: *backend
+    command: ["python", "-m", "app.workers.depth"]
+  research:
+    <<: *backend
+    command: ["python", "-m", "app.workers.research"]
+  research-archive:
+    <<: *backend
+    command: ["python", "-m", "app.workers.research_archive"]
   frontend:
     build: ./frontend
     ports:

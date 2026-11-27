@@ -4,7 +4,7 @@ Hyperliquid 主网只读行情、历史数据研究和观察池。包含 M1 行�
 
 ## 一键启动
 
-Docker 会运行 PostgreSQL、API、采集 worker、回测 worker 和前端。使用 Docker 启动时，宿主机无需另外安装 PostgreSQL、Python 或 Node.js。空数据库会自动迁移初始化。
+Docker 会运行 PostgreSQL、API、采集 worker、回测 worker、盘口采集、研究计算和前端。使用 Docker 启动时，宿主机无需另外安装 PostgreSQL、Python 或 Node.js。空数据库会自动迁移初始化。
 
 ### Windows
 
@@ -107,3 +107,14 @@ docker compose config --quiet
 - 基础风控检查可用资金、保证金、持仓数和总敞口。L1 报告用作工程验证，保证金阶梯、强平预测、实时模拟及盘口撮合属于后续工作。
 - 信号研究在策略运行结束后单独计算方向收益和 MFE/MAE。仅对当前 K 线粒度能完整覆盖的 1、5、15、60 分钟窗口给出样本。
 - `TEST_DATABASE_URL` 指向隔离 PostgreSQL 后运行 `python -m pytest -p no:cacheprovider backend/tests -q`。浏览器验收可设置 `M2_REPORT_ID` 为带已平仓交易的回测 ID，再运行 `npm --prefix frontend run test:e2e`。
+
+## Research Lab（V2 R0–R3）
+
+使用原有一键启动脚本。新增 `depth` 采集和 `research` 计算服务，行情持续采集可通过 `docker compose logs -f depth` 查看。研究默认采集 10 个原生 USDC 永续的 l2Book、BBO 和逐笔成交，资产名单可在 `.env` 配置 `RESEARCH_ASSETS`（交易所代码，逗号分隔，最多 20）。研究数据独立记录实际接收和可用时间。L2 为交易所有限档快照。
+
+在「Research Lab」检查覆盖与延迟，选择资产并创建历史回放或实时研究。S01 默认需要至少约一小时的历史预热与基准，快速验证可将 `warmup_s` 和 `baseline_s` 都设为 60，再用较短标签周期。查看任务覆盖率、A–D 消融、未来收益、BBO 可执行估计与事件详情。研究结果按事件、配置和原始数据指纹追溯。样本不足时显示状态，BBO 估计各腿受可见数量约束并按版本化费率和滑点计算。
+
+- 基线验收使用隔离 PostgreSQL。前端可使用 `npm --prefix frontend run test:e2e` 检查实际 Research Lab 报告。传入 `RESEARCH_TEST_API` 可将研究接口定向到隔离的本地 API。
+- 归档例子 `docker compose exec api python -m app.market_data.archive --date 2026-11-26 --dataset research.l2`，使用已经完成的 UTC 日期。原始档位和共享时序元数据按资产/流/日期保存并校验，可按已固定的归档重放。
+- `GET /api/v1/research/quality/retention` 打印保留策略预览。已引用的分区标记为 pinned，当前没有自动清理。研究采集先于 M1 的临界空间阈值暂停，默认恢复滞回量为 128 MiB。
+- 容量、长期稳定性与当前剩余项目见 [研究进度](doc/RESEARCH_PROGRESS.md)。

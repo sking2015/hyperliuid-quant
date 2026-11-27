@@ -15,6 +15,7 @@ from psycopg.types.json import Jsonb
 from pydantic import BaseModel, Field
 
 from app.backtest.routes import router as backtest_router
+from app.research.routes import router as research_router
 from app.config import MINUTES
 from app.market_data.coverage import interval_coverage
 from app.market_data.monitor import RequestMetrics
@@ -39,6 +40,7 @@ async def lifespan(app):
 
 app = FastAPI(title="HL Quant Lab", version="1.0", lifespan=lifespan)
 app.include_router(backtest_router)
+app.include_router(research_router)
 api_metrics = RequestMetrics()
 
 

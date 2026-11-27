@@ -261,3 +261,224 @@ def test_backtest_freezes_observation_pool_membership(database, raw):
     assert task["status"] == "SUCCEEDED"
     assert task["configuration"]["watchlist"]["id"] == pool["id"]
     assert task["configuration"]["instrument_ids"] == ["PERP::0"]
+
+def test_research_fixture_to_event_label_api_and_archive(database, raw, tmp_path, monkeypatch):
+    import hashlib
+    from datetime import datetime, timezone
+    from uuid import UUID
+
+    import duckdb
+    from psycopg.types.json import Jsonb
+
+    from app.market_data.archive import archive_day
+    from app.research import routes as research_routes
+    from app.research.feed import normalize, health_rows
+    from app.workers.research import Runner
+
+    monkeypatch.setattr(research_routes,"DATA_DIR",tmp_path)
+
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    iid = "PERP::0"
+    token_data, _ = spot_rows(*raw["spot"])
+    connection = UUID(int=1)
+    with storage.connect() as db:
+        catalog(db, "PERP", "", perp_rows(*raw["perp"], token_data, "", 0), now())
+        with db.cursor() as cursor:
+            for offset in range(132):
+                ts = start + timedelta(seconds=offset)
+                tick_ms = int(ts.timestamp()*1000)
+                mid = 100 if offset < 100 else 100.2 + (offset-100)*.001
+                price = str(mid)
+                events = list(health_rows({"BTC":iid},ts,connection,True))
+                bbo = {"coin":"BTC","time":tick_ms,
+                       "bbo":[{"px":str(mid-.01),"sz":"100"},{"px":str(mid+.01),"sz":"100"}]}
+                trades = [{"coin":"BTC","time":tick_ms,"px":price,
+                           "sz":"3" if offset>=71 else "1","side":"B","tid":offset}]
+                for channel,data in (("bbo",bbo),("trades",trades)):
+                    events.extend(normalize({"channel":channel,"data":data},{"BTC":iid},ts,connection))
+                cursor.executemany("""
+                    INSERT INTO market_events(event_id,instrument_id,event_type,exchange_ts,received_ts,payload,
+                        connection_id,quality,source,schema_version,available_ts,ingest_seq)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,'fixture',2,%s,nextval('research_ingest_seq'))
+                    ON CONFLICT DO NOTHING
+                """,[(*event,ts) for event in events])
+    [parquet] = archive_day(start.date(),tmp_path,"research.bbo")
+    with duckdb.connect() as d:
+        assert d.read_parquet(str(parquet)).count("*").fetchone()[0]==132
+        assert d.read_parquet(str(parquet)).order("available_ts, ingest_seq").limit(1).select("instrument_id").fetchone()==(iid,)
+    root = "/api/v1/research"
+    params = {"warmup_s":60,"baseline_s":60,"horizons_s":[5,15]}
+    config = database.post(root+"/configs",json=params).json()
+    epoch = int(start.timestamp()*1000)
+    result = database.post(root+"/experiments",json={"asset_ids":[iid],"mode":"REPLAY","start_ms":epoch+100000,
+                           "end_ms":epoch+130000,"config_hash":config["hash"]})
+    assert result.status_code==202,result.text
+    run_id=result.json()["id"]
+    with storage.connect() as db:
+        assert db.execute("SELECT count(*) AS n FROM research_data_pins WHERE run_id=%s",(run_id,)).fetchone()["n"]==1
+        job=db.execute("SELECT r.*,c.parameters FROM research_runs r JOIN research_configs c ON c.hash=r.config_hash WHERE r.id=%s",(run_id,)).fetchone()
+    for _ in range(2):
+        task=Runner(job,archive_root=tmp_path)
+        while not task.advance(epoch+145000):
+            pass
+    verified=database.get(root+"/runs/"+run_id).json()
+    with storage.connect() as db:
+        db.execute("DELETE FROM market_events WHERE event_type='research.bbo'")
+    task=Runner(job,archive_root=tmp_path)
+    while not task.advance(epoch+145000):
+        pass
+    final=database.get(root+"/runs/"+run_id).json()
+    assert verified["source_hash"]==final["source_hash"]
+    assert final["status"]=="COMPLETE" and final["stats"]["covered_ticks"]>0
+    events=database.get(root+"/events",params={"run_id":run_id,"state":"CONFIRMED"}).json()
+    assert {row["variant"] for row in events}=={"A","B","C","D"}
+    assert len(events)==4 and len({row["episode_id"] for row in events})==1
+    detail=database.get(root+"/events/"+events[0]["id"]).json()
+    assert [v["status"] for v in detail["labels"]]==["COMPLETE","COMPLETE"]
+    assert detail["labels"][0]["detail"]["execution"]["status"]=="filled"
+    window=database.get(root+"/events/"+events[0]["id"]+"/replay").json()["rows"]
+    assert any(row["event_type"]=="research.bbo" for row in window)
+    retention=database.get(root+"/quality/retention").json()
+    assert retention["dry_run"] and retention["partitions"][0]["pinned"]
+    assert not retention["partitions"][0]["archive_purge_candidate"]
+    assert all(row["attempts"]==1 for row in database.get(root+"/forward-returns",params={"run_id":run_id}).json())
+
+
+def test_replay_matures_labels_after_detection_end(database, raw, tmp_path, monkeypatch):
+    from app.workers.research import Runner
+
+    test_research_fixture_to_event_label_api_and_archive(database, raw, tmp_path, monkeypatch)
+    root = "/api/v1/research"
+    fixture_run = database.get(root+"/runs").json()[0]
+    start = fixture_run["start_ms"]
+    end = start+5000
+    response = database.post(root+"/runs",json={"asset_ids":["PERP::0"],"mode":"REPLAY",
+        "start_ms":start,"end_ms":end,"config_hash":fixture_run["config_hash"]})
+    assert response.status_code == 202
+    run_id = response.json()["id"]
+    with storage.connect() as db:
+        job = db.execute("""
+            SELECT r.*,c.parameters FROM research_runs r
+            JOIN research_configs c ON c.hash=r.config_hash WHERE r.id=%s
+        """,(run_id,)).fetchone()
+    runner = Runner(job,archive_root=tmp_path)
+    while runner.cursor < start:
+        assert not runner.advance(start)
+    events = database.get(root+"/events",params={"run_id":run_id,"state":"CONFIRMED"}).json()
+    assert len(events) == 4 and {event["detected_ms"] for event in events} == {start}
+    detail = root+"/events/"+events[0]["id"]
+    assert [(l["horizon_s"],l["status"]) for l in database.get(detail).json()["labels"]] == [(5,"PENDING"),(15,"PENDING")]
+    # Restart the runner with the same job ID. Both targets have BBO input in the fixture.
+    runner = Runner(job,archive_root=tmp_path)
+    while not runner.advance(end+15000):
+        pass
+    labels = database.get(detail).json()["labels"]
+    actual = [(l["horizon_s"],l["status"]) for l in labels]
+    assert actual == [(5,"COMPLETE"),(15,"COMPLETE")]
+    with storage.connect() as db:
+        assert not db.execute("SELECT 1 FROM research_events WHERE run_id=%s AND detected_ms>=%s",(run_id,end)).fetchone()
+    assert database.get(root+"/runs/"+run_id).json()["input_sequence"] == job["input_sequence"]
+
+    stopped = database.post(root+"/runs",json={"asset_ids":["PERP::0"],"mode":"REPLAY",
+        "start_ms":start,"end_ms":end,"config_hash":fixture_run["config_hash"]}).json()
+    with storage.connect() as db:
+        stopped_job = db.execute("""
+            SELECT r.*,c.parameters FROM research_runs r JOIN research_configs c ON c.hash=r.config_hash WHERE r.id=%s
+        """,(stopped["id"],)).fetchone()
+    runner = Runner(stopped_job,archive_root=tmp_path)
+    while runner.cursor < start:
+        assert not runner.advance(start)
+    assert runner.advance(start,stopping=True)
+    event = database.get(root+"/events",params={"run_id":stopped["id"],"state":"CONFIRMED"}).json()[0]
+    labels = database.get(root+"/events/"+event["id"]).json()["labels"]
+    assert all(item["status"]=="CENSORED" and item["detail"]["reason"]=="task_stopped" for item in labels)
+    assert database.get(root+"/forward-returns",params={"run_id":stopped["id"]}).json()==[]
+    assert database.get(root+"/forward-returns",params={"run_id":stopped["id"],"diagnostic":True}).json()
+
+    empty = database.post(root+"/runs",json={"asset_ids":["PERP::0"],"mode":"REPLAY",
+        "start_ms":start-86400000,"end_ms":end-86400000,"config_hash":fixture_run["config_hash"]}).json()
+    assert empty["status"]=="INSUFFICIENT_DATA"
+    assert {issue["reason"] for issue in empty["preflight"]["issues"]}=={"no_records"}
+
+    from app.research.store import stamp
+    with storage.connect() as db:
+        db.execute("""
+            INSERT INTO market_events(event_id,instrument_id,event_type,received_ts,available_ts,
+                 source,schema_version,payload,connection_id,quality,ingest_seq)
+            SELECT 'missing-target',instrument_id,event_type,received_ts,available_ts,source,schema_version,
+                   '{"connected":false}',connection_id,'[]',nextval('research_ingest_seq')
+            FROM market_events WHERE event_type='research.health' AND available_ts=%s
+        """,(stamp(start+5000),))
+    config = database.post(root+"/configs",json={"warmup_s":60,"baseline_s":60,
+                                                "horizons_s":[5,60]}).json()
+    incomplete = database.post(root+"/runs",json={"asset_ids":["PERP::0"],"mode":"REPLAY",
+        "start_ms":start,"end_ms":end,"config_hash":config["hash"]}).json()
+    with storage.connect() as db:
+        incomplete_job = db.execute("""
+            SELECT r.*,c.parameters FROM research_runs r JOIN research_configs c ON c.hash=r.config_hash WHERE r.id=%s
+        """,(incomplete["id"],)).fetchone()
+    runner = Runner(incomplete_job,archive_root=tmp_path)
+    while not runner.advance(runner.label_end):
+        pass
+    assert database.get(root+"/runs/"+incomplete["id"]).json()["status"]=="INSUFFICIENT_DATA"
+    event = database.get(root+"/events",params={"run_id":incomplete["id"],"state":"CONFIRMED"}).json()[0]
+    labels = database.get(root+"/events/"+event["id"]).json()["labels"]
+    assert [(item["status"],item["detail"]["reason"]) for item in labels] == [
+        ("MISSING","missing_or_stale_target_bbo"),("CENSORED","source_window_ended")]
+
+
+def test_research_publication_recovers_committed_staging_and_preserves_clock_order(database, raw):
+    from datetime import datetime, timezone
+    from threading import Event, Thread
+
+    from app.research.feed import persist
+    from app.research.store import feed_rows
+
+    token_data,_ = spot_rows(*raw["spot"])
+    with storage.connect() as db:
+        catalog(db,"PERP","",perp_rows(*raw["perp"],token_data,"",0),now())
+    iid = "PERP::0"
+    past = datetime(2026,1,1,tzinfo=timezone.utc)
+    future = now()+timedelta(minutes=1)
+    start = int(past.timestamp()*1000)
+    end = int(future.timestamp()*1000)+1000
+    inserted = Event()
+    release = Event()
+    failures = []
+
+    def reader_side_writer():
+        try:
+            with storage.connect() as writer:
+                writer.execute("""
+                    INSERT INTO market_events(event_id,instrument_id,event_type,exchange_ts,received_ts,
+                         source,schema_version,payload,connection_id,quality)
+                    VALUES ('staged-late',%s,'research.trade',%s,%s,'hyperliquid_research_ws_v3',
+                            3,'{}',%s,'[]')
+                """,(iid,past,future,uuid4()))
+                inserted.set()
+                assert release.wait(10)
+        except Exception as exc:
+            failures.append(exc)
+
+    thread = Thread(target=reader_side_writer)
+    thread.start()
+    try:
+        assert inserted.wait(10)
+        # A second writer commits out of exchange order while the first transaction is still open.
+        from psycopg.types.json import Jsonb
+        current = now()
+        persist([("newer",iid,"research.trade",current,current,Jsonb({}),uuid4(),Jsonb([]))],{})
+        with storage.connect() as reader:
+            assert [r["event_id"] for r in feed_rows(reader,[iid],start,end)]==["newer"]
+    finally:
+        release.set()
+        thread.join(10)
+    assert not thread.is_alive() and not failures
+    with storage.connect() as reader:
+        assert [r["event_id"] for r in feed_rows(reader,[iid],start,end)]==["newer"]
+    persist([],{})
+    with storage.connect() as reader:
+        rows = feed_rows(reader,[iid],start,end)
+        assert [r["event_id"] for r in rows]==["newer","staged-late"]
+        assert rows[1]["available_ts"]==future and rows[1]["ingest_seq"]>rows[0]["ingest_seq"]
+        assert [r["event_id"] for r in feed_rows(reader,[iid],start,end,rows[0]["ingest_seq"])]==["newer"]

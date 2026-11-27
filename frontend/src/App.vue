@@ -8,14 +8,15 @@ import Watchlists from './views/Watchlists.vue'
 
 const Strategies = defineAsyncComponent(() => import('./views/Strategies.vue'))
 const Backtests = defineAsyncComponent(() => import('./views/Backtests.vue'))
-const page = ref<'markets' | 'watchlists' | 'strategies' | 'backtests' | 'system'>('markets')
+const ResearchLab = defineAsyncComponent(() => import('./views/ResearchLab.vue'))
+const page = ref<'markets' | 'watchlists' | 'strategies' | 'backtests' | 'research' | 'system'>('markets')
 const preset = ref<{ id: string; params: Record<string, number | string> }>()
 
 function useStrategy(id: string, params: Record<string, number | string>) {
   preset.value = { id, params }
   page.value = 'backtests'
 }
-const labels = { markets: '市场', watchlists: '观察池', strategies: '策略', backtests: '回测', system: '系统' }
+const labels = { markets: '市场', watchlists: '观察池', strategies: '策略', backtests: '回测', research: 'Research Lab', system: '系统' }
 const utc = ref(true)
 const classic = ref(false)
 const status = ref<Status>()
@@ -92,6 +93,7 @@ onUnmounted(() => { stopped = true; clearTimeout(retry); socket?.close() })
       <Watchlists v-if="page === 'watchlists'" :utc="utc" />
       <Strategies v-if="page === 'strategies'" @backtest="useStrategy" />
       <Backtests v-if="page === 'backtests'" :utc="utc" :preset="preset" />
+      <ResearchLab v-if="page === 'research'" :utc="utc" />
       <section v-if="page === 'system'" class="panel">
         <div v-if="status">
           <dl class="metrics">

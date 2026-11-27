@@ -1,12 +1,12 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
-import { CandlestickSeries, createChart, type IChartApi, type ISeriesApi, type UTCTimestamp } from 'lightweight-charts'
+import { CandlestickSeries, createChart, createSeriesMarkers, type IChartApi, type ISeriesApi, type UTCTimestamp } from 'lightweight-charts'
 import { api } from '../api/client'
 import { dateTime, numeric } from '../format'
 import { minutes } from '../types/backtest'
 import type { Bar, MarketIdentity } from '../types/models'
 
-const props = defineProps<{ markets: MarketIdentity[]; interval: string; start: string; end: string; utc: boolean }>()
+const props = defineProps<{ markets: MarketIdentity[]; interval: string; start: string; end: string; utc: boolean; title?: string; markerMs?: number }>()
 const selected = ref(props.markets[0]?.instrument_id ?? '')
 const symbol = computed(() => props.markets.find(market => market.instrument_id === selected.value)?.symbol)
 const target = ref<HTMLElement>()
@@ -48,6 +48,13 @@ async function load() {
       time: (Date.parse(bar.open_ts) / 1000) as UTCTimestamp,
       open: Number(bar.o), high: Number(bar.h), low: Number(bar.l), close: Number(bar.c),
     })))
+    if (props.markerMs != null) {
+      const marker = Math.floor(props.markerMs / step) * step
+      if (bars.some(bar => Date.parse(bar.open_ts) === marker)) {
+        createSeriesMarkers(series, [{time:(marker/1000) as UTCTimestamp,position:'aboveBar',
+          shape:'arrowDown',color:'#366480',text:'研究事件'}])
+      }
+    }
     count.value = bars.length
     chart?.timeScale().fitContent()
   } catch (cause) {
@@ -81,9 +88,9 @@ onUnmounted(() => { revision++; chart?.remove(); chart = undefined; series = und
 </script>
 
 <template>
-  <section aria-label="回测时段 K 线">
+  <section  :aria-label="title ?? '回测时段 K 线'">
     <div class="toolbar">
-      <h2>回测时段 K 线</h2>
+      <h2>{{ title ?? '回测时段 K 线' }}</h2>
       <el-select v-if="markets.length > 1" v-model="selected" aria-label="图表交易对" style="width:160px">
         <el-option v-for="market in markets" :key="market.instrument_id" :value="market.instrument_id" :label="market.symbol" />
       </el-select>

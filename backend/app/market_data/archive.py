@@ -4,6 +4,7 @@ import shutil
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from uuid import uuid4
+from urllib.parse import quote
 
 import duckdb
 
@@ -36,7 +37,16 @@ EVENT_QUERY = """
     WHERE i.market_type=%s AND e.received_ts>=%s AND e.received_ts<%s AND e.event_type=%s
     ORDER BY e.received_ts,e.event_id
 """
-DATASETS = ("candles", "bbo", "trades")
+RESEARCH_DATASETS = ("research.bbo","research.trade","research.l2","research.health","research.context")
+RESEARCH_SCHEMA = EVENT_SCHEMA + ", available_ts TIMESTAMPTZ, ingest_seq BIGINT, connection_id VARCHAR, quality VARCHAR"
+RESEARCH_QUERY = """
+    SELECT event_id,instrument_id,event_type,exchange_ts,received_ts,source,schema_version,
+           payload::text AS payload,available_ts,ingest_seq,connection_id::text AS connection_id,
+           quality::text AS quality
+    FROM market_events WHERE instrument_id=%s AND available_ts>=%s AND available_ts<%s
+      AND event_type=%s AND ingest_seq IS NOT NULL ORDER BY available_ts,ingest_seq,event_id
+"""
+DATASETS = ("candles", "bbo", "trades", *RESEARCH_DATASETS)
 
 
 def checksum(path):
@@ -44,7 +54,7 @@ def checksum(path):
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
-def archive_day(day, root=DATA_DIR, dataset='candles'):
+def archive_day(day, root=DATA_DIR, dataset='candles', only_unpublished=False):
     if dataset not in DATASETS:
         raise ValueError('unsupported Parquet dataset')
     if day >= datetime.now(timezone.utc).date():
@@ -58,7 +68,17 @@ def archive_day(day, root=DATA_DIR, dataset='candles'):
     partitions = []
     with connect() as db:
         db.execute("SELECT pg_advisory_xact_lock(6022028)")
-        for kind in MARKET_TYPES:
+        keys = MARKET_TYPES
+        if dataset in RESEARCH_DATASETS:
+            keys = [row["instrument_id"] for row in db.execute("""
+                SELECT DISTINCT instrument_id FROM market_events e
+                WHERE ingest_seq IS NOT NULL AND available_ts>=%s AND available_ts<%s AND event_type=%s
+                AND (NOT %s OR NOT EXISTS (
+                    SELECT FROM market_data_manifest m WHERE m.dataset_id=e.event_type
+                    AND m.partition_date=%s AND m.market_type=e.instrument_id))
+                ORDER BY instrument_id
+            """, (start,end,dataset,only_unpublished,day))]
+        for kind in keys:
             partition = archive_partition(db, root, day, kind, start, end, dataset)
             if partition:
                 partitions.append(partition)
@@ -66,10 +86,14 @@ def archive_day(day, root=DATA_DIR, dataset='candles'):
 
 
 def archive_partition(db, root, day, kind, start, end, dataset):
-    folder = root / "parquet" / dataset / f"date={day}" / f"market_type={kind}"
+    research = dataset in RESEARCH_DATASETS
+    partition = f"asset={quote(kind,safe='')}" if research else f"market_type={kind}"
+    folder = root / "parquet" / dataset / f"date={day}" / partition
     is_candle = dataset == "candles"
     schema = CANDLE_SCHEMA if is_candle else EVENT_SCHEMA
     query = CANDLE_QUERY if is_candle else EVENT_QUERY
+    if research:
+        schema, query = RESEARCH_SCHEMA, RESEARCH_QUERY
     parameters = (kind, start, end) if is_candle else (kind, start, end, dataset)
     with db.cursor(name="parquet_source") as rows, duckdb.connect() as out:
         rows.execute(query, parameters)
@@ -89,6 +113,8 @@ def archive_partition(db, root, day, kind, start, end, dataset):
         try:
             out.table("exported").write_parquet(str(temporary), compression="zstd")
             start_col, end_col = ("open_ts", "close_ts") if is_candle else ("received_ts", "received_ts")
+            if research:
+                start_col = end_col = "available_ts"
             observed_count, first, last = out.read_parquet(str(temporary)).aggregate(
                 f"count(*), epoch_us(min({start_col})), epoch_us(max({end_col}))").fetchone()
             epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
@@ -107,6 +133,16 @@ def archive_partition(db, root, day, kind, start, end, dataset):
                 INSERT INTO market_data_manifest VALUES (%s,%s,%s,%s,%s,1,%s,%s,%s,now())
                 ON CONFLICT DO NOTHING
             """, (dataset, day, kind, destination.relative_to(root).as_posix(), digest, first, last, count))
+            if research:
+                db.execute("""
+                    INSERT INTO research_data_pins(run_id,path)
+                    SELECT r.id,%s FROM research_runs r JOIN research_configs c ON c.hash=r.config_hash
+                    WHERE %s=ANY(r.asset_ids)
+                      AND to_timestamp(coalesce(r.follow_end_ms,r.end_ms)/1000.0) >= %s
+                      AND to_timestamp(r.start_ms/1000.0 - greatest((c.parameters->>'warmup_s')::integer,
+                          (c.parameters->>'baseline_s')::integer+60)) <= %s
+                    ON CONFLICT DO NOTHING
+                """,(destination.relative_to(root).as_posix(),kind,first,last))
             return destination
         finally:
             temporary.unlink(missing_ok=True)

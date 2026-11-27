@@ -1,22 +1,35 @@
 # HL Quant Lab
 
-Hyperliquid 主网只读行情、历史数据研究和观察池。当前交付 M1，控制台显示 PAPER MODE。
+Hyperliquid 主网只读行情、历史数据研究和观察池。包含 M1 行情采集与观察池、M2 历史回测，控制台显示 PAPER MODE。
 
-## 启动
+## 一键启动
 
-安装并启动 Docker 及 Compose v2。Windows PowerShell 和 Linux shell 均在项目根目录执行：
+Docker 会运行 PostgreSQL、API、采集 worker、回测 worker 和前端。使用 Docker 启动时，宿主机无需另外安装 PostgreSQL、Python 或 Node.js。空数据库会自动迁移初始化。
 
-```sh
-docker compose up --build -d
+### Windows
+
+1. 首次安装 Docker Desktop，启用 WSL 2 后端并使用 Linux 容器。首次打开 Docker Desktop 时，完成许可提示和 WSL 初始化。
+2. 以后双击项目根目录的 `start.bat`。Docker 已就绪时会直接启动项目。Docker 未运行时，脚本会尝试启动 Docker Desktop 并等待。如果 Desktop 使用自定义安装位置且 CLI 无法启动它，请先手动打开 Desktop，再双击脚本。
+3. 启动成功后会在浏览器打开控制台。从 PowerShell 运行 `.\start.bat --no-browser` 可跳过打开浏览器和失败时的暂停。
+
+### Linux
+
+安装 Docker Engine 和 Docker Compose v2 插件。首次部署时确认 Docker 服务已启动，并且当前账号可运行 `docker info`。在使用 systemd 的发行版上，可由管理员运行 `sudo systemctl enable --now docker` 启动服务并设为开机启动。
+
+```bash
+bash start.sh
 ```
 
-打开 http://localhost:5173。API 地址为 http://localhost:8000/docs。空数据库通过 SQL 迁移初始化。端口绑定到环回地址。首次全市场补齐由 worker 限速轮转，系统页面会显示积压。Docker 数据卷在普通停止和重启时保留。
+也可执行 `chmod +x start.sh` 后使用 `./start.sh`。脚本会切换到项目目录，可通过绝对路径从其他目录调用。
 
-```sh
-docker compose ps
-docker compose logs -f market
-docker compose restart market api
-```
+### 访问与排查
+
+- 控制台 [http://127.0.0.1:5173](http://127.0.0.1:5173)
+- API 文档 [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs)
+- 两个脚本会构建镜像、后台启动服务并检查前端能否连到 API。首次需要下载镜像和依赖，行情补齐仍会在启动成功后继续。
+- 服务只绑定本机。远程 Linux 服务器可在本地运行 `ssh -N -L 5173:127.0.0.1:5173 -L 8000:127.0.0.1:8000 user@server`，再打开上述地址。
+- 查看状态用 `docker compose ps -a`，查看日志用 `docker compose logs --tail 80`。如果提示端口已占用，检查本机 5173 或 8000 上正在运行的服务。
+- 停止用 `docker compose stop`。重新运行启动脚本会继续使用原有数据卷。`docker compose down -v` 会删除数据库和行情数据卷。
 
 ## 原生开发
 

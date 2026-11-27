@@ -122,6 +122,13 @@ async function cancel(run: Run) {
   catch (cause) { error.value = (cause as Error).message }
 }
 function symbol(id: string) { return selected.value?.configuration.markets.find(m => m.instrument_id === id)?.symbol ?? id }
+function summarizeTrades({ columns, data }: { columns: { property?: string }[]; data: Trade[] }) {
+  const total = data.reduce((sum, trade) => sum + Number(trade.net_pnl), 0)
+  return columns.map((column, index) => {
+    if (index === 0) return '总计'
+    return column.property === 'net_pnl' ? `${numeric(total, 4)} USDC` : ''
+  })
+}
 function showTrade(row: Trade) {
   trade.value = row
   instrument.value = { instrument_id: row.instrument_id, symbol: symbol(row.instrument_id) }
@@ -238,7 +245,8 @@ onUnmounted(() => { stopping = true; clearInterval(poll) })
       </p>
       <p class="muted">K 线来源 {{ report.manifest.candle_sources.join(' / ') }} · 数据 SHA-256 {{ report.manifest.sha256 }}</p>
       <div class="toolbar"><h2>交易明细</h2><a :href="'/api/v1/backtests/' + selected.id + '/trades.csv'">导出 CSV</a></div>
-      <el-table :data="report.trades" empty-text="暂无已平仓交易" @row-click="showTrade">
+      <el-table :data="report.trades" empty-text="暂无已平仓交易" show-summary
+        :summary-method="summarizeTrades" @row-click="showTrade">
         <el-table-column label="交易对" min-width="100"><template #default="{ row }"><el-button link type="primary" @click.stop="showTrade(row)">{{ symbol(row.instrument_id) }}</el-button></template></el-table-column>
         <el-table-column prop="side" label="方向" width="85" />
         <el-table-column label="开仓时间" min-width="145"><template #default="{ row }">{{ dateTime(row.entry_time, utc) }}</template></el-table-column>
@@ -248,7 +256,7 @@ onUnmounted(() => { stopping = true; clearInterval(poll) })
         <el-table-column label="数量" min-width="95"><template #default="{ row }">{{ numeric(row.quantity) }}</template></el-table-column>
         <el-table-column label="手续费" min-width="95"><template #default="{ row }">{{ numeric(row.fees, 4) }}</template></el-table-column>
         <el-table-column label="资金费率净额" min-width="115"><template #default="{ row }">{{ numeric(row.funding, 5) }}</template></el-table-column>
-        <el-table-column label="净盈亏" min-width="105"><template #default="{ row }">{{ numeric(row.net_pnl, 4) }}</template></el-table-column>
+        <el-table-column prop="net_pnl" label="净盈亏" min-width="130"><template #default="{ row }">{{ numeric(row.net_pnl, 4) }}</template></el-table-column>
         <el-table-column label="原因" min-width="100"><template #default="{ row }">{{ reasons[row.reason] ?? row.reason }}</template></el-table-column>
       </el-table>
       <el-collapse v-if="report.signal_research"><el-collapse-item title="信号研究">

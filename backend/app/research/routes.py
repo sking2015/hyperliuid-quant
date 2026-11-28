@@ -11,15 +11,17 @@ from pydantic import BaseModel, Field, ValidationError
 from app.config import DATA_DIR
 from app.market_data.repository import now
 from app.research.archive import ArchivedFeed
-from app.research.config import FEATURE_VERSION
+from app.research.config import FEATURE_VERSION, ResearchParameters
 from app.research.detectors import DETECTORS
 from app.research.features import ms
 from app.research.feed import PUBLICATION_LOCK
-from app.research.inputs import code_hash, replay_input, windows
+from app.research.inputs import code_hash, longest_replay_range, replay_input, windows
 from app.research.store import feed_rows, stamp
 from app.storage.db import connect
 
 router = APIRouter(prefix="/api/v1/research", tags=["research"])
+MAX_REPLAY_SECONDS = 14_400
+NO_REPLAY_RANGE = "历史记录中未找到同时满足报价时效、预热、成交基准和标签观察时间的区间。"
 
 
 @router.get("/detectors")
@@ -48,7 +50,14 @@ def quality():
             FROM research_stability_samples WHERE minute>=now()-interval '24 hours'
         """).fetchone()
         compute = db.execute("SELECT heartbeat,state FROM worker_leases WHERE component='research_compute'").fetchone()
-    return {"collector":state,"streams":rows,"window_seconds":3600,"stability":stability,"compute":compute}
+        assets = db.execute("""
+            SELECT i.instrument_id,i.symbol FROM instruments i
+            WHERE i.market_type='PERP' AND i.quote='USDC' AND EXISTS (
+                SELECT 1 FROM market_events m WHERE m.instrument_id=i.instrument_id
+                AND m.event_type='research.health' AND m.ingest_seq IS NOT NULL
+            ) ORDER BY i.symbol,i.instrument_id
+        """).fetchall()
+    return {"collector":state,"streams":rows,"window_seconds":3600,"stability":stability,"compute":compute,"assets":assets}
 
 
 @router.post("/configs",status_code=201)
@@ -75,7 +84,23 @@ class Draft(BaseModel):
     asset_ids: list[str] = Field(min_length=1,max_length=20)
     start_ms: int | None = None
     end_ms: int | None = None
+    auto_range: bool = False
     duration_s: int = Field(3600,ge=1,le=14400)
+
+
+class ReplayRangeDraft(BaseModel):
+    asset_ids: list[str] = Field(min_length=1,max_length=20)
+    parameters: ResearchParameters
+
+
+@router.post("/replay-range")
+def replay_range(draft: ReplayRangeDraft):
+    params = draft.parameters.model_dump()
+    assets = set(draft.asset_ids)
+    if params["reference_asset"]:
+        assets.add(params["reference_asset"])
+    with connect() as db:
+        return longest_replay_range(db, sorted(assets), params, MAX_REPLAY_SECONDS)
 
 
 @router.post("/runs",status_code=202)
@@ -84,10 +109,12 @@ def start(draft: Draft):
     current = ms(now())//1000*1000
     assets = sorted(set(draft.asset_ids))
     left,right = (current+1000,current+1000+draft.duration_s*1000) if draft.mode=="LIVE" else (draft.start_ms,draft.end_ms)
-    if left is None or right is None or not 0 < right-left <= 14_400_000 or left < 0 or left%1000 or right%1000:
-        raise HTTPException(422,"使用已对齐整秒的时间范围，最长四小时")
-    if draft.mode=="REPLAY" and right > current:
-        raise HTTPException(422,"回放终点必须已发生")
+    automatic = draft.mode == "REPLAY" and draft.auto_range
+    if not automatic:
+        if left is None or right is None or not 0 < right-left <= MAX_REPLAY_SECONDS*1000 or left < 0 or left%1000 or right%1000:
+            raise HTTPException(422,"使用已对齐整秒的时间范围，最长四小时")
+        if draft.mode == "REPLAY" and right > current:
+            raise HTTPException(422,"回放终点必须已发生")
     with connect() as db:
         stored = db.execute("SELECT parameters FROM research_configs WHERE hash=%s",(draft.config_hash,)).fetchone()
         if not stored:
@@ -107,12 +134,19 @@ def start(draft: Draft):
             if not set(assets)<={r["instrument_id"] for r in available}:
                 raise HTTPException(422,"实时研究只支持已配置持续采集的资产")
         params = stored["parameters"]
-        warmup,follow = windows(left,right,params)
         input_assets = sorted(set(assets + ([params["reference_asset"]] if params.get("reference_asset") else [])))
+        if automatic:
+            chosen = longest_replay_range(db, input_assets, params, MAX_REPLAY_SECONDS)
+            left, right = chosen["start_ms"], chosen["end_ms"]
+            if left is None or right is None:
+                raise HTTPException(409, NO_REPLAY_RANGE)
+        warmup,follow = windows(left,right,params)
         if draft.mode=="REPLAY":
             db.execute("SELECT pg_advisory_xact_lock(%s)",(PUBLICATION_LOCK,))
         sequence,watermark,preflight,pins = replay_input(
             db,input_assets,warmup,left,right,follow,max(params["horizons_s"])*1000,params["bbo_age_ms"])
+        if automatic and (preflight["blocking"] or watermark < follow):
+            raise HTTPException(409, NO_REPLAY_RANGE)
         if draft.mode=="LIVE":
             sequence = watermark = None
         run = db.execute("""
@@ -132,9 +166,16 @@ def start(draft: Draft):
 
 
 @router.get("/runs")
-def runs(limit: int = Query(30,ge=1,le=100)):
+def runs(limit: int = Query(30,ge=1,le=100), results: bool = False):
     with connect() as db:
-        return db.execute("SELECT * FROM research_runs ORDER BY created_at DESC,id DESC LIMIT %s",(limit,)).fetchall()
+        return db.execute("""
+            SELECT r.* FROM research_runs r
+            WHERE NOT %s OR (r.status='COMPLETE' AND EXISTS (
+                SELECT 1 FROM research_events e JOIN research_labels l ON l.event_id=e.id
+                WHERE e.run_id=r.id AND l.status='COMPLETE'
+            ))
+            ORDER BY r.created_at DESC,r.id DESC LIMIT %s
+        """, (results, limit)).fetchall()
 
 
 @router.get("/runs/{run_id}")

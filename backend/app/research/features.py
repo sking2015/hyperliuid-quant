@@ -121,6 +121,24 @@ class FeatureEngine:
         if healthy and s.context and self.tick - s.context[0] <= 120_000:
             s.oi[t] = s.context[1]
 
+    def research_covered(self, iid):
+        state = self.assets[iid]
+        tick = self.tick // 1000
+        if tick not in state.quotes or tick - 60 not in state.quotes:
+            return False
+
+        def healthy_seconds(end, width):
+            first, last = state.prefixes.get(end - width), state.prefixes.get(end)
+            return last[4] - first[4] if first is not None and last is not None else 0
+
+        threshold = self.config.min_coverage
+        if (healthy_seconds(tick, 60) != 60
+                or healthy_seconds(tick, self.config.warmup_s) / self.config.warmup_s < threshold):
+            return False
+        bins = self.config.baseline_s // 30
+        complete = sum(healthy_seconds(tick - 30 * i, 30) == 30 for i in range(1, bins + 1))
+        return complete / bins >= threshold
+
     def snapshot(self, iid, as_of_ms):
         if as_of_ms != self.tick:
             raise ValueError("Snapshots are only valid at the current as-of tick")

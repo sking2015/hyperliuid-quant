@@ -262,6 +262,70 @@ def test_backtest_freezes_observation_pool_membership(database, raw):
     assert task["configuration"]["watchlist"]["id"] == pool["id"]
     assert task["configuration"]["instrument_ids"] == ["PERP::0"]
 
+def test_research_default_range_uses_longest_shared_continuous_history(database, raw):
+    from datetime import datetime, timezone
+
+    from app.workers.research import Runner
+
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    epoch = int(start.timestamp() * 1000)
+    meta, contexts = raw["perp"]
+    meta["universe"].append({**meta["universe"][0], "name": "ETH"})
+    contexts.append(contexts[0])
+    tokens, _ = spot_rows(*raw["spot"])
+    btc, eth = "PERP::0", "PERP::1"
+    with storage.connect() as db:
+        catalog(db, "PERP", "", perp_rows(meta, contexts, tokens, "", 0), now())
+        # BTC's newer connection is longer but all of its quotes arrive late. ETH starts later,
+        # and an explicit gap during their overlap leaves a shorter shared span.
+        for asset, first, last in [(btc, 0, 360), (btc, 500, 1000), (eth, 30, 360)]:
+            db.execute("""
+                INSERT INTO market_events(event_id,instrument_id,event_type,received_ts,source,schema_version,
+                    payload,available_ts,ingest_seq,connection_id,exchange_ts)
+                SELECT %s || ':' || kind || ':' || tick, %s, kind,tick,'fixture',3,
+                    CASE kind WHEN 'research.health' THEN '{"connected":true}'::jsonb
+                              WHEN 'research.bbo' THEN '{"bbo":[{"px":"100","sz":"1"},{"px":"101","sz":"1"}]}'::jsonb
+                              ELSE '{"px":"100","sz":"1","aggressor":"buy"}'::jsonb END,
+                    tick,nextval('research_ingest_seq'),%s,
+                    CASE WHEN %s AND kind='research.bbo' THEN tick-interval '1 hour' ELSE tick END
+                FROM generate_series(%s::timestamptz,%s::timestamptz,interval '1 second') AS tick
+                CROSS JOIN unnest(ARRAY['research.health','research.bbo','research.trade']) AS kind
+            """, (asset, asset, uuid4(), first == 500, start + timedelta(seconds=first), start + timedelta(seconds=last)))
+        db.execute("INSERT INTO data_gaps VALUES (%s,'research.trade',%s,%s,'websocket_disconnect',false)",
+                   (eth, start + timedelta(seconds=110), start + timedelta(seconds=160)))
+
+    prefix = "/api/v1/research"
+    quality = database.get(prefix + "/quality").json()
+    assert quality["streams"] == []
+    assert [asset["symbol"] for asset in quality["assets"]] == ["BTC", "ETH"]
+    body = {"asset_ids": [btc], "parameters": {"warmup_s": 60, "baseline_s": 60, "horizons_s": [30]}}
+    response = database.post(prefix + "/replay-range", json=body)
+    assert response.status_code == 200, response.text
+    assert response.json() == {"start_ms": epoch + 120_000, "end_ms": epoch + 331_000}
+    body["asset_ids"] = [btc, eth]
+    assert database.post(prefix + "/replay-range", json=body).json() == {
+        "start_ms": epoch + 280_000, "end_ms": epoch + 331_000,
+    }
+    config = database.post(prefix + "/configs", json=body["parameters"]).json()["hash"]
+    draft = {"asset_ids": body["asset_ids"], "config_hash": config, "auto_range": True}
+    result = database.post(prefix + "/experiments", json=draft)
+    assert result.status_code == 202, result.text
+    queued = result.json()
+    assert queued["start_ms"] == epoch + 280_000
+    assert database.get(prefix + "/runs?results=true").json() == []
+    runner = Runner({**queued, "parameters": body["parameters"]})
+    while not runner.advance(epoch + 360_000):
+        pass
+    completed = database.get(prefix + "/runs/" + queued["id"]).json()
+    assert completed["status"] == "COMPLETE" and completed["stats"]["covered_ticks"] == 102
+    body["parameters"]["baseline_s"] = 300
+    assert database.post(prefix + "/replay-range", json=body).json() == {"start_ms": None, "end_ms": None}
+    draft["config_hash"] = database.post(prefix + "/configs", json=body["parameters"]).json()["hash"]
+    assert database.post(prefix + "/experiments", json=draft).status_code == 409
+    assert len(database.get(prefix + "/runs").json()) == 1
+    assert database.get(prefix + "/runs?results=true").json() == []
+
+
 def test_research_fixture_to_event_label_api_and_archive(database, raw, tmp_path, monkeypatch):
     import hashlib
     from datetime import datetime, timezone
@@ -399,6 +463,7 @@ def test_replay_matures_labels_after_detection_end(database, raw, tmp_path, monk
         "start_ms":start-86400000,"end_ms":end-86400000,"config_hash":fixture_run["config_hash"]}).json()
     assert empty["status"]=="INSUFFICIENT_DATA"
     assert {issue["reason"] for issue in empty["preflight"]["issues"]}=={"no_records"}
+    assert {run["id"] for run in database.get(root+"/runs?results=true").json()} == {run_id, fixture_run["id"]}
 
     from app.research.store import stamp
     with storage.connect() as db:

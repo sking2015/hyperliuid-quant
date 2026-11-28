@@ -51,7 +51,7 @@ class ResearchEngine:
                 continue
             self.stats["asset_ticks"] += 1
             self.asset_coverage[iid]["total"] += 1
-            if values["warmup"]["value"] and values["mid"]["valid"] and values["return_60"]["valid"] and values["rvol_30"]["coverage"] >= self.config.min_coverage:
+            if self.features.research_covered(iid):
                 self.stats["covered_ticks"] += 1
                 self.asset_coverage[iid]["covered"] += 1
             started = perf_counter()
